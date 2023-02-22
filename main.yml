@@ -1,0 +1,131 @@
+---
+- name: "Fetching Instance Details"
+  become: false
+  hosts: localhost
+  vars:
+    region: "ap-south-1"
+    asg_name: "ansible-asg"
+  tasks:
+    - name: "Gathering Asg Instance Details {{ asg_name }}"
+      amazon.aws.ec2_instance_info:
+        region: "{{ region }}"
+        filters:
+          "tag:aws:autoscaling:groupName": "{{ asg_name }}"
+          "tag:Project": "zomato"
+          "tag:env": "dev"
+          instance-state-name: [ "running"]
+      register: instance_stats
+
+    - name: "Creating Dynamic Inventory"
+      add_host:
+        groups: "asg_instances"
+        hostname: "{{ item.public_ip_address  }}"
+        ansible_ssh_user: "ec2-user"
+        ansible_ssh_host: '{{ item.public_ip_address  }}'
+        ansible_ssh_port: "22"
+        ansible_ssh_private_key_file: "devops.pem"
+        ansible_ssh_common_args: "-o StrictHostKeyChecking=no"  
+      with_items: "{{ instance_stats.instances }}"
+
+- name: "Deploying Website To Asg Instances"
+  become: true
+  hosts: asg_instances
+  serial: 1
+  vars:
+    git_repo: "https://github.com/Haashmi-h/aws-elb-site.git"
+    httpd_owner: "apache"
+    httpd_group: "apache"
+    httpd_port: "80"
+    domain: "web.haashdev.tech"
+    health_check_delay: 25
+    pkgs:
+      - httpd
+      - php
+      - git
+    clone_dir: "/var/website/"
+  tasks:
+
+    - name: "Installation of packages needed for the instances"
+      yum: 
+        name: "{{ pkgs }}"
+        state: present
+      notify:
+        - apache-reload
+                                                                
+    - name: "Creating httpd.conf file from template"
+      template:
+        src: ./httpd.conf.j2
+        dest: /etc/httpd/conf/httpd.conf 
+        owner: "{{ httpd_owner }}"
+        group: "{{ httpd_group }}"
+      notify:
+        - apache-reload
+                                                                                                                                        
+    - name: "Creating VirtualHost {{ domain }} from template"
+      template:
+        src: "./virtualhost.conf.j2"
+        dest: "/etc/httpd/conf.d/{{ domain }}.conf"
+        owner: "{{ httpd_owner }}"
+        group: "{{ httpd_group }}" 
+      notify:
+        - apache-reload
+                       
+    - name: "Creating DocumentRoot /var/www/html/{{ domain }}"
+      file:
+        path: "/var/www/html/{{ domain }}"
+        state: directory
+        owner: "{{ httpd_owner }}"
+        group: "{{ httpd_group }}"
+                                                                                                                                                                                                                                                                          
+    - name: "Creating Clone Directory {{ clone_dir }}"
+      file:
+        path: "{{ clone_dir }}"
+        state: directory                                                                                                                                                                              
+    - name: "Clone Website Contents From {{ git_repo }}"
+      git:
+        repo: "{{ git_repo }}"
+        dest: "{{ clone_dir }}"
+      register: clone_status
+      notify:
+        - apache-restart
+        - online-delay
+ 
+    - name: "off-loading Instance {{ ansible_fqdn }}"
+      when: clone_status.changed
+      service:
+        name: httpd
+        state: stopped
+      notify:
+        - apache-restart
+        - online-delay
+
+    - name: "Waiting for connection draining {{ ansible_fqdn }}"
+      when: clone_status.changed
+      wait_for:
+        timeout: "{{ health_check_delay }}"
+
+    - name: "Copying Website Files To /var/www/html/{{ domain }}"
+      when: clone_status.changed
+      copy:
+        src: "{{ clone_dir }}"
+        dest: "/var/www/html/{{ domain }}"
+        remote_src: true
+      notify:
+        - apache-restart
+        - online-delay
+  handlers:
+    - name: "apache-reload"
+      service:
+        name: httpd
+        state: reloaded
+        enabled: true
+
+    - name: "apache-restart"
+      service:
+        name: httpd
+        state: restarted
+        enabled: true
+
+    - name: "online-delay"
+      wait_for:
+        timeout: "40"
